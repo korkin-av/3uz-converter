@@ -1,0 +1,166 @@
+#include <avr/interrupt.h>
+
+#define TIMER_FREQ (F_CPU / 64UL) // 16 МГц / 64 = 250000 Гц
+
+struct VoltageToFreq {
+  float voltage;
+  float frequency;
+};
+
+VoltageToFreq table[30] = {
+  {1.111, 18.01},
+  {1.241, 21.88},
+  {1.371, 26.18},
+  {1.502, 34.97832945711012},
+  {1.632, 45.88079445432159},
+  {1.762, 55.92816415763413},
+  {1.892, 69.6},
+  {2.023, 82.03},
+  {2.153, 96.23},
+  {2.283, 119.31},
+  {2.413, 139.86},
+  {2.544, 170.92},
+  {2.674, 201.5},
+  {2.804, 237.68},
+  {2.934, 268.88},
+  {3.065, 299.84},
+  {3.195, 334.76},
+  {3.325, 373.45},
+  {3.455, 407.16},
+  {3.586, 448.02},
+  {3.716, 489.21},
+  {3.846, 532.88},
+  {3.976, 587.81},
+  {4.107, 652.21},
+  {4.237, 714.61},
+  {4.367, 793.21},
+  {4.497, 890.54},
+  {4.628, 984.65},
+  {4.758, 1079.49},
+  {4.888, 1166.86}
+};
+int currentSize = 30;
+
+volatile uint16_t ocrTicks;
+volatile uint16_t pendingOcrTicks;
+volatile float currentVoltage;
+volatile bool updatePending = false;
+float lastUsedVoltage;
+
+void sortTable() {
+  for (int i = 0; i < currentSize - 1; i++) {
+    for (int j = 0; j < currentSize - i - 1; j++) {
+      if (table[j].voltage > table[j + 1].voltage) {
+        VoltageToFreq temp = table[j];
+        table[j] = table[j + 1];
+        table[j + 1] = temp;
+      }
+    }
+  }
+}
+
+float getFrequencyFromVoltage(float v) {
+  if (v <= 0.690) return 7.0;
+  if (v <= table[0].voltage) return table[0].frequency;
+  if (v >= table[currentSize - 1].voltage) return table[currentSize - 1].frequency;
+  
+  for (int i = 0; i < currentSize - 1; i++) {
+    if (v >= table[i].voltage && v < table[i + 1].voltage) {
+      float v1 = table[i].voltage, f1 = table[i].frequency;
+      float v2 = table[i + 1].voltage, f2 = table[i + 1].frequency;
+      float t = (v - v1) / (v2 - v1);
+      return f1 + t * (f2 - f1);
+    }
+  }
+  return table[currentSize - 1].frequency;
+}
+
+ISR(TIMER1_COMPA_vect) {
+  static uint8_t toggleCount = 0;
+  toggleCount = (toggleCount + 1) % 2;
+  if (toggleCount == 0 && updatePending) {
+    OCR1A = pendingOcrTicks;
+    lastUsedVoltage = currentVoltage;
+    updatePending = false;
+  }
+}
+
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    int space1 = command.indexOf(' ');
+    String cmd = space1 == -1 ? command : command.substring(0, space1);
+    
+    if (cmd == "set") {
+      int space2 = command.indexOf(' ', space1 + 1);
+      int space3 = command.indexOf(' ', space2 + 1);
+      String indexStr = command.substring(space1 + 1, space2);
+      String voltageStr = command.substring(space2 + 1, space3);
+      String frequencyStr = command.substring(space3 + 1);
+      int index = indexStr.toInt();
+      float voltage = voltageStr.toFloat();
+      float frequency = frequencyStr.toFloat();
+      
+      if (index >= 0 && index < currentSize) {
+        table[index].voltage = voltage;
+        table[index].frequency = frequency;
+        sortTable();
+        Serial.println("OK: Точка " + String(index) + " обновлена: " + 
+                      String(voltage) + "V, " + String(frequency) + "Hz");
+      } else {
+        Serial.println("Ошибка: Неверный индекс (0-29)");
+      }
+    } else if (cmd == "get") {
+      for (int i = 0; i < currentSize; i++) {
+        Serial.println(String(i) + ": " + 
+                      String(table[i].voltage, 3) + " " + 
+                      String(table[i].frequency, 2));
+      }
+      Serial.println("END");
+    } else if (cmd == "get_voltage") {
+      Serial.println(String(currentVoltage, 3));
+    } else {
+      Serial.println("Ошибка: Неизвестная команда");
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  Serial.setTimeout(100);
+
+ 
+  sortTable(); 
+
+  int raw = analogRead(A0);
+  lastUsedVoltage = raw * (5.0 / 1023.0);
+  currentVoltage = lastUsedVoltage;
+
+  float freq = getFrequencyFromVoltage(lastUsedVoltage);
+  if (freq < 1.0) freq = 1.0;
+  ocrTicks = (uint16_t)(TIMER_FREQ / (2.0 * freq));
+  OCR1A = ocrTicks;
+  
+  pinMode(9, OUTPUT);
+  digitalWrite(9, LOW);
+  analogReference(DEFAULT);
+  TCCR1A = (1 << COM1A0);
+  TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
+  TIMSK1 = (1 << OCIE1A);
+  sei();
+}
+
+void loop() {
+  static unsigned long lastRead = 0;
+  if (millis() - lastRead >= 1) {
+    int raw = analogRead(A0);
+    currentVoltage = raw * (5.0 / 1023.0);
+    float freq = getFrequencyFromVoltage(currentVoltage);
+    if (freq < 1.0) freq = 1.0;
+    pendingOcrTicks = (uint16_t)(TIMER_FREQ / (2.0 * freq));
+    updatePending = true;
+    lastRead = millis();
+  }
+  handleSerialCommands();
+}
